@@ -14,11 +14,80 @@ func pongServer(s string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(s)) }))
 }
 
-func TestIntegration(t *testing.T) {
+func adminAndProxy() (admin, proxy *httptest.Server) {
 	p := New()
 	h := p.adminMux()
 
-	admin := httptest.NewServer(h)
+	return httptest.NewServer(h), httptest.NewServer(http.HandlerFunc(p.index))
+}
+
+func TestMultipleHosts(t *testing.T) {
+	a := pongServer("pong a")
+	b := pongServer("pong b")
+
+	admin, proxy := adminAndProxy()
+
+	if rsp, err := updateConfig(admin.URL, &Config{Address: a.URL}); err != nil {
+		t.Fatal(err)
+	} else if rsp.code != 201 {
+		t.Errorf("expected code to be 201, was %d", rsp.code)
+	}
+
+	if rsp, err := updateConfig(admin.URL, &Config{Path: "some.host.com", Address: b.URL}); err != nil {
+		t.Fatal(err)
+	} else if rsp.code != 201 {
+		t.Errorf("expected code to be 201, was %d", rsp.code)
+	}
+
+	if rsp, err := rspWrapper(http.Get(admin.URL)); err != nil {
+		t.Fatal(err)
+	} else {
+		ex := `{"/":{"address":"` + a.URL + `","path":"/"},"some.host.com/":{"address":"` + b.URL + `","path":"some.host.com/"}}`
+
+		if rsp.body != ex {
+			t.Errorf("expected body to be\n%q\nwas\n%q", rsp.body, ex)
+		}
+	}
+
+	rsp, err := rspWrapper(http.Get(proxy.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest("GET", proxy.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "some.host.com"
+
+	rsp2, err := rspWrapper(http.DefaultClient.Do(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		Name     string
+		Expected interface{}
+		Value    interface{}
+	}{
+		{"rw.Code", 200, rsp.code},
+		{"rw.Body", "pong a", rsp.body},
+		{"rw2.Code", 200, rsp2.code},
+		{"rw2.Body", "pong b", rsp2.body},
+	}
+
+	for _, tst := range tests {
+		if tst.Expected != tst.Value {
+			t.Errorf("expected %s to be %#v, was %#v", tst.Name, tst.Expected, tst.Value)
+		}
+	}
+}
+
+func TestIntegration(t *testing.T) {
+	a := pongServer("first server")
+	b := pongServer("second server")
+
+	admin, proxy := adminAndProxy()
 
 	rsp, err := rspWrapper(http.Get(admin.URL + "/"))
 	if err != nil {
@@ -40,23 +109,18 @@ func TestIntegration(t *testing.T) {
 		}
 	}
 
-	s := pongServer("first server")
+	rsp, err = updateConfig(admin.URL, &Config{Address: a.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	b, err := json.Marshal(&Config{Address: s.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsp, err = rspWrapper(http.Post(admin.URL, "application/json", bytes.NewReader(b)))
-	if err != nil {
-		t.Fatal(err)
-	}
 	tests = []struct {
 		Name     string
 		Expected interface{}
 		Value    interface{}
 	}{
 		{"Code", 201, rsp.code},
-		{"Body", `{"address":"` + s.URL + `"}`, rsp.body},
+		{"Body", `{"address":"` + a.URL + `","path":"/"}`, rsp.body},
 	}
 
 	for _, tst := range tests {
@@ -65,15 +129,7 @@ func TestIntegration(t *testing.T) {
 		}
 	}
 
-	req, err := http.NewRequest("GET", "/", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rw := httptest.NewRecorder()
-	p.index(rw, req)
-
-	b, err = ioutil.ReadAll(rw.Body)
+	rsp, err = rspWrapper(http.Get(proxy.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +139,8 @@ func TestIntegration(t *testing.T) {
 		Expected interface{}
 		Value    interface{}
 	}{
-		{"Code", 200, rw.Code},
-		{"Body", "first server", string(b)},
+		{"Code", 200, rsp.code},
+		{"Body", "first server", rsp.body},
 	}
 
 	for _, tst := range tests {
@@ -93,29 +149,7 @@ func TestIntegration(t *testing.T) {
 		}
 	}
 
-	s = pongServer("second server")
-
-	b, err = json.Marshal(&Config{Address: s.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsp, err = rspWrapper(http.Post(admin.URL, "application/json", bytes.NewReader(b)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests = []struct {
-		Name     string
-		Expected interface{}
-		Value    interface{}
-	}{
-		{"Code", 201, rsp.code},
-		{"Body", `{"address":"` + s.URL + `"}`, rsp.body},
-	}
-
-	rw = httptest.NewRecorder()
-	p.index(rw, req)
-
-	b, err = ioutil.ReadAll(rw.Body)
+	rsp, err = updateConfig(admin.URL, &Config{Address: b.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,8 +159,22 @@ func TestIntegration(t *testing.T) {
 		Expected interface{}
 		Value    interface{}
 	}{
-		{"Code", 200, rw.Code},
-		{"Body", "second server", string(b)},
+		{"Code", 201, rsp.code},
+		{"Body", `{"address":"` + b.URL + `"}`, rsp.body},
+	}
+
+	rsp, err = rspWrapper(http.Get(proxy.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests = []struct {
+		Name     string
+		Expected interface{}
+		Value    interface{}
+	}{
+		{"Code", 200, rsp.code},
+		{"Body", "second server", rsp.body},
 	}
 
 	for _, tst := range tests {
@@ -134,26 +182,9 @@ func TestIntegration(t *testing.T) {
 			t.Errorf("expected %s to be %#v, was %#v", tst.Name, tst.Expected, tst.Value)
 		}
 	}
-
 }
 
-type rsp struct {
-	code int
-	body string
-}
-
-func rspWrapper(r *http.Response, err error) (*rsp, error) {
-	if err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
-	return &rsp{code: r.StatusCode, body: string(b)}, nil
-}
-
+// verify how the go default mux handles subdomains
 func TestMux(t *testing.T) {
 	m := http.NewServeMux()
 	m.HandleFunc("domain.de/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("domain.de")) })
@@ -201,6 +232,31 @@ func TestMux(t *testing.T) {
 		}
 	}
 
+}
+
+func updateConfig(adminURL string, c *Config) (*rsp, error) {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	return rspWrapper(http.Post(adminURL, "application/json", bytes.NewReader(b)))
+}
+
+type rsp struct {
+	code int
+	body string
+}
+
+func rspWrapper(r *http.Response, err error) (*rsp, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp{code: r.StatusCode, body: string(b)}, nil
 }
 
 func init() {

@@ -29,10 +29,10 @@ func New() *Proxy {
 }
 
 type Proxy struct {
-	mutex sync.Mutex
-	px    http.HandlerFunc
-	cfg   *Config
-	wg    *sync.WaitGroup
+	mutex   sync.Mutex
+	px      http.Handler
+	wg      *sync.WaitGroup
+	configs map[string]*Config
 }
 
 func (p *Proxy) Start() error {
@@ -65,7 +65,7 @@ func (p *Proxy) startLB() error {
 	if !strings.Contains(port, ":") {
 		port = "0.0.0.0:" + port
 	}
-	return http.ListenAndServe(port, p.lbMux())
+	return http.ListenAndServe(port, http.HandlerFunc(p.index))
 }
 
 func (p *Proxy) startAdmin() error {
@@ -84,91 +84,102 @@ func (p *Proxy) Wait() error {
 	return nil
 }
 
-func (b *Proxy) lbMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", b.index)
-	return mux
-}
-
 func (p *Proxy) adminMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.adminHandler)
 	return mux
 }
 
-type Config struct {
-	Address  string          `json:"address,omitempty"`
-	Path     string          `json:"path,omitempty"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
-}
-
-func (p *Proxy) setProxy(cfg *Config) error {
-	u, err := url.Parse(cfg.Address)
-	if err != nil {
-		return err
+func (p *Proxy) updateConfig(cfg *Config) error {
+	if cfg.Address == "" {
+		return errors.New("address must be set")
 	}
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.cfg = cfg
-	p.px = httputil.NewSingleHostReverseProxy(u).ServeHTTP
+	if p.configs == nil {
+		p.configs = map[string]*Config{}
+	}
+	if !strings.HasSuffix(cfg.Path, "/") {
+		cfg.Path += "/"
+	}
+	p.configs[cfg.Path] = cfg
+
+	mux := http.NewServeMux()
+
+	for path, cfg := range p.configs {
+		u, err := url.Parse(cfg.Address)
+		if err != nil {
+			return err
+		}
+		mux.Handle(path, httputil.NewSingleHostReverseProxy(u))
+	}
+	p.px = mux
 	return nil
 }
 
-func (p *Proxy) config() *Config {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	if p.cfg == nil {
-		return &Config{}
-	}
-	return p.cfg
-}
-
-func (p *Proxy) proxy() http.HandlerFunc {
+func (p *Proxy) proxy() http.Handler {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	return p.px
 }
 
+func (p *Proxy) Configs() ([]byte, error) {
+	return json.Marshal(p.configs)
+}
+
 func (p *Proxy) adminHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		cfg := p.config()
-		b, err := json.Marshal(cfg)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.Write(b)
-		return
-	} else if r.Method == "POST" {
-		var cfg *Config
-		err := func() error {
-			err := json.NewDecoder(r.Body).Decode(&cfg)
-			if err != nil {
-				return err
-			}
-			if cfg.Address == "" {
-				return errors.New("address must be set")
-			}
-			if err := p.setProxy(cfg); err != nil {
-				return err
-			}
-			b, err := json.Marshal(cfg)
-			if err != nil {
-				return err
-			}
-			w.WriteHeader(http.StatusCreated)
-			w.Write(b)
-			return nil
-		}()
-		if err != nil {
-			logger.Printf("err=%q", err)
-			http.Error(w, "Not Acceptable: "+err.Error(), http.StatusNotAcceptable)
-			return
-		}
+	switch r.Method {
+	case "GET":
+		p.getConfigHandler(w, r)
+	case "POST":
+		p.updateConfigHandler(w, r)
+	default:
+		code := http.StatusMethodNotAllowed
+		http.Error(w, http.StatusText(code), code)
 	}
-	return
+}
+
+func (p *Proxy) getConfigHandler(w http.ResponseWriter, r *http.Request) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if p.configs == nil {
+		p.configs = map[string]*Config{}
+	}
+	writeJSON(w, http.StatusOK, p.configs)
+}
+
+func writeJSON(w http.ResponseWriter, code int, i interface{}) {
+	b, err := json.Marshal(i)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(code)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
+
+}
+
+func (p *Proxy) updateConfigHandler(w http.ResponseWriter, r *http.Request) {
+	var cfg *Config
+	err := func() error {
+		err := json.NewDecoder(r.Body).Decode(&cfg)
+		if err != nil {
+			return err
+		}
+		if err := p.updateConfig(cfg); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusCreated, cfg)
+		return nil
+	}()
+	if err != nil {
+		logger.Printf("err=%q", err)
+		http.Error(w, "Not Acceptable: "+err.Error(), http.StatusNotAcceptable)
+		return
+	}
 }
 
 func (p *Proxy) index(w http.ResponseWriter, r *http.Request) {
-	p.proxy()(w, r)
+	p.proxy().ServeHTTP(w, r)
 }
