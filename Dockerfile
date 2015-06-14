@@ -1,4 +1,4 @@
-FROM golang:1.4.1
+FROM golang:1.4.2
 
 ENV GOPATH /
 ENV PORT 8000
