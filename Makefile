@@ -6,7 +6,7 @@ vet:
 build:
 	go get ./...
 
-test:
+test: build
 	go test -v ./...
 
 docker_build:
