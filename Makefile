@@ -9,7 +9,11 @@ build:
 test: build
 	go test -v ./...
 
-docker_build:
+static_build:
+	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ./bin/drp
+	ls -lh ./bin/
+
+docker_build: static_build
 	docker build -t dynport/drp .
 
 docker_run: docker_build
